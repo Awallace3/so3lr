@@ -87,18 +87,16 @@ def parse_args(argv=None):
 
 # --------------------------------------------------------------------------- data
 class Prefetch:
-    """Build numpy batches on a background thread."""
+    """Pack ``order`` into fixed-cap batches on a background thread."""
 
-    def __init__(self, store, order, batch_dimers, three_pass, per_residue_embed, depth=6):
+    def __init__(self, store, order, caps, three_pass, per_residue_embed, skipped, depth=6):
         self.q = queue.Queue(maxsize=depth)
-        self.n = int(np.ceil(len(order) / batch_dimers))
-        chunks = [order[k * batch_dimers:(k + 1) * batch_dimers] for k in range(self.n)]
-        from so3lr.sapt.batch import make_batch
+        from so3lr.sapt.batch import make_batch, pack
 
         def work():
             try:
-                for c in chunks:
-                    self.q.put((c, make_batch(store, c, three_pass=three_pass,
+                for c in pack(store, order, caps, three_pass, skipped=skipped):
+                    self.q.put((c, make_batch(store, c, three_pass=three_pass, caps=caps,
                                               per_residue_embed=per_residue_embed)))
             except Exception as exc:          # surface in the consumer
                 self.q.put(exc)
@@ -140,7 +138,7 @@ def main(argv=None):
     import flax
 
     from so3lr.sapt.store import DimerStore
-    from so3lr.sapt.batch import make_batch
+    from so3lr.sapt.batch import make_batch, estimate_caps, CAP_KEYS
     from so3lr.sapt.model import (SAPTModel, OUTPUTS, THREE_PASS, load_backbone,
                                   merge_pretrained, reference_components)
 
@@ -165,7 +163,7 @@ def main(argv=None):
 
     net, bb_params, model_prov = load_backbone(args.model_dir, pretrained=arm["pretrained"])
     model = SAPTModel(backbone=net, path=path)
-    example = make_batch(val, np.arange(min(4, len(val))), three_pass=three, per_residue_embed=pre)
+    example = make_batch(val, np.arange(min(4, len(val))), three_pass=three, per_residue_embed=pre)  # init only
     params = model.init(jax.random.PRNGKey(args.seed), example)
     extra = []
     if bb_params is not None:
@@ -192,7 +190,13 @@ def main(argv=None):
     trainable_mask = jax.tree_util.tree_map(lambda l: l != "frozen", labels)
 
     n_tr = len(train) if args.max_train_dimers is None else min(len(train), args.max_train_dimers)
-    steps_per_epoch = int(np.ceil(n_tr / args.batch_dimers))
+    caps = {s: estimate_caps(st, three, args.batch_dimers, seed=args.seed) for s, st in stores.items()}
+    for s, c in caps.items():
+        print(f"caps[{s}] " + json.dumps(c), flush=True)
+    tc = caps[args.train_split]
+    per_batch = min([tc["dimers"]] + [(tc[k] - 1) / tc["mean_cost"][k] for k in CAP_KEYS
+                                      if tc["mean_cost"][k] > 0])
+    steps_per_epoch = int(np.ceil(n_tr / per_batch))   # estimate; packing decides the real count
     if args.max_steps_per_epoch:
         steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
     total_steps = max(1, steps_per_epoch * args.epochs)
@@ -218,9 +222,11 @@ def main(argv=None):
     def loss_fn(p, batch):
         pred, aux = model.apply(freeze(p), batch)
         ref = reference_components(batch["targets"], path)
+        dm = batch["dimer_mask"]
+        nd = jnp.maximum(dm.sum(), 1.0)
         err = pred - ref
-        comp = jnp.mean(err ** 2, axis=0)
-        tot = jnp.mean((pred.sum(-1) - batch["targets"].sum(-1)) ** 2)
+        comp = jnp.sum(dm[:, None] * err ** 2, axis=0) / nd
+        tot = jnp.sum(dm * (pred.sum(-1) - batch["targets"].sum(-1)) ** 2) / nd
         loss = comp.sum() + args.w_total * tot
         anchor = jnp.zeros(())
         if lam_q > 0:
@@ -244,13 +250,17 @@ def main(argv=None):
     def predict(p, batch):
         return model.apply(p, batch)[0]
 
-    def evaluate(p, store, cap=None, keep=False):
+    def evaluate(p, split, cap=None, keep=False):
+        store = stores[split]
         n = len(store) if cap is None else min(cap, len(store))
-        preds, refs, rows = [], [], []
-        for ids, b in Prefetch(store, np.arange(n), args.batch_dimers, three, pre):
-            preds.append(np.asarray(predict(p, b)))
-            refs.append(b["targets"])
+        preds, refs, rows, skipped = [], [], [], []
+        for ids, b in Prefetch(store, np.arange(n), caps[split], three, pre, skipped):
+            k = len(ids)
+            preds.append(np.asarray(predict(p, b))[:k])
+            refs.append(b["targets"][:k])
             rows.append(store.pickle_row[ids])
+        if skipped:
+            raise RuntimeError(f"{split}: {len(skipped)} dimers exceed the caps, e.g. rows {skipped[:5]}")
         pred = np.concatenate(preds)
         ref4 = np.concatenate(refs)
         refc = np.asarray(reference_components(ref4, path))
@@ -259,7 +269,9 @@ def main(argv=None):
         if path in ("A", "C"):
             res["mae_elst+ind"] = float(np.mean(np.abs(pred[:, 0] + pred[:, 2] - ref4[:, 0] - ref4[:, 2])))
         res["sel_metric"] = float(sum(res[f"mae_{c}"] for c in outputs))
-        res["n"] = int(n)
+        res["n"] = int(len(pred))
+        if res["n"] != n:
+            raise RuntimeError(f"{split}: evaluated {res['n']} of {n} rows")
         if keep:
             return res, dict(pred=pred, ref=ref4, pickle_row=np.concatenate(rows), outputs=np.array(outputs))
         return res
@@ -284,7 +296,7 @@ def main(argv=None):
     config = dict(arm=args.arm, path=path, arm_spec=arm, charge_anchor=lam_q, args=vars(args),
                   outputs=list(outputs), model=model_prov, new_backbone_params=extra,
                   data={s: st.provenance() for s, st in stores.items()},
-                  steps_per_epoch=steps_per_epoch, total_steps=total_steps,
+                  steps_per_epoch_estimate=steps_per_epoch, total_steps=total_steps, caps=caps,
                   jax=dict(version=jax.__version__, devices=[str(d) for d in jax.devices()]))
     (out / "config.json").write_text(json.dumps(config, indent=1, default=str))
 
@@ -313,17 +325,23 @@ def main(argv=None):
     while state["epoch"] < args.epochs and not stopped:
         ep = state["epoch"]
         order = np.random.default_rng(args.seed * 100003 + ep).permutation(n_tr)
-        order = order[: steps_per_epoch * args.batch_dimers]
         acc, t_ep = [], time.time()
         t_saved = time.time()
-        for ids, b in Prefetch(train, order[state["pos"] * args.batch_dimers:], args.batch_dimers, three, pre):
+        skipped, n_batches = [], 0
+        t_log = time.time()
+        for ids, b in Prefetch(train, order[state["pos"]:], tc, three, pre, skipped):
+            if args.max_steps_per_epoch and n_batches >= args.max_steps_per_epoch:
+                break
             params, opt_state, met = train_step(params, opt_state, b)
-            state["pos"] += 1
+            state["pos"] += len(ids)          # dimers consumed in this epoch's permutation
             state["step"] += 1
+            n_batches += 1
             acc.append(jax.device_get(met))
             if state["step"] % args.log_every == 0:
                 m = {k: np.mean([a[k] for a in acc[-args.log_every:]], axis=0) for k in acc[-1]}
-                rec = dict(kind="train", epoch=ep, step=state["step"], loss=float(m["loss"]),
+                now = time.time()
+                step_s, t_log = (now - t_log) / args.log_every, now
+                rec = dict(kind="train", epoch=ep, step=state["step"], loss=float(m["loss"]), step_s=step_s,
                            mse_total=float(m["mse_total"]), gnorm=float(m["gnorm"]),
                            anchor=float(m["anchor"]),
                            **{f"mse_{c}": float(m["mse"][k]) for k, c in enumerate(outputs)})
@@ -343,10 +361,12 @@ def main(argv=None):
             (out / "STOPPED_EARLY").write_text(f"epoch {ep} pos {state['pos']} step {state['step']}\n")
             print(f"stopping early at epoch {ep} pos {state['pos']}", flush=True)
             break
-        vres = evaluate(params, val, args.max_eval_dimers)
+        if skipped:
+            print(f"WARNING: {len(skipped)} training dimers exceed the caps and were skipped", flush=True)
+        vres = evaluate(params, args.val_split, args.max_eval_dimers)
         tr_loss = float(np.mean([a["loss"] for a in acc])) if acc else float("nan")
         rec = dict(kind="val", epoch=ep, step=state["step"], train_loss=tr_loss,
-                   epoch_s=time.time() - t_ep, **{f"val_{k}": v for k, v in vres.items()})
+                   epoch_s=time.time() - t_ep, train_batches=n_batches, train_skipped=len(skipped), **{f"val_{k}": v for k, v in vres.items()})
         improved = state["best"] is None or vres["sel_metric"] < state["best"]["sel_metric"]
         if improved:
             state["best"] = dict(epoch=ep, **vres)
@@ -371,7 +391,7 @@ def main(argv=None):
         with open(out / "ckpt" / "best.pkl", "rb") as fh:
             best = pickle.load(fh)
         bp = jax.tree_util.tree_map(jnp.asarray, best["params"])
-        tres, rows = evaluate(bp, test, args.max_eval_dimers, keep=True)
+        tres, rows = evaluate(bp, args.test_split, args.max_eval_dimers, keep=True)
         results["test"] = dict(epoch=best["epoch"], **tres)
         np.savez_compressed(out / "test_predictions.npz", **rows)
         log(dict(kind="test", epoch=best["epoch"], **{f"test_{k}": v for k, v in tres.items()}))
