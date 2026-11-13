@@ -340,6 +340,27 @@ class AtomTypeEmbedSparse(BaseSubModule):
                                    'prop_keys': self.prop_keys}}
 
 
+def _per_residue_psi(inputs, psi, key):
+    """Embed psi per residue (monomer) instead of per graph when ``inputs[key]`` is set.
+
+    ``inputs[key]`` is (num_graphs, R): the charge or unpaired-electron count of every
+    residue, with ``residue_segments`` naming each atom's residue. The embedding then
+    runs over num_graphs * R segments, so an atom only ever sees its own monomer's
+    charge -- a dimer at infinite separation embeds exactly like its two monomers.
+    Opt-in and input-only: no parameter changes, and without the key nothing changes.
+    """
+    batch_segments = inputs['batch_segments']
+    graph_mask = inputs['graph_mask']
+    per_residue = inputs.get(key)
+    if per_residue is None:
+        return psi, batch_segments, graph_mask
+    num_graphs = len(graph_mask)
+    per_residue = jnp.asarray(per_residue, dtype=psi.dtype).reshape(num_graphs, -1)
+    num_residues = per_residue.shape[1]
+    segments = batch_segments * num_residues + jnp.asarray(inputs['residue_segments'], jnp.int32)
+    return per_residue.reshape(-1), segments, jnp.repeat(graph_mask, num_residues)
+
+
 class ChargeSpinEmbedSparse(nn.Module):
     num_features: int
     activation_fn: str = 'silu'
@@ -467,6 +488,8 @@ class ChargeEmbedSparse(BaseSubModule):
             # full_like keeps psi at (num_graphs) and floating dtype, which
             # ChargeSpinEmbedSparse asserts on.
             Q = jnp.full_like(Q, self.total_charge_override)
+        else:
+            Q, batch_segments, graph_mask = _per_residue_psi(inputs, Q, 'residue_charge_embed')
 
         return ChargeSpinEmbedSparse(
             zmax=self.zmax,
@@ -520,6 +543,7 @@ class SpinEmbedSparse(BaseSubModule):
             raise ValueError(
                 f'SpinEmbedSparse requires to pass `num_unpaired_electrons != None`.'
             )
+        S, batch_segments, graph_mask = _per_residue_psi(inputs, S, 'residue_unpaired_embed')
 
         return ChargeSpinEmbedSparse(
             zmax=self.zmax,
