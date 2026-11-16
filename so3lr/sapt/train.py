@@ -26,14 +26,15 @@ import numpy as np
 
 ARMS = {
     # id: path, backbone training, pretrained, backbone lr scale, charge anchor
+    # (lambda_q = 0 for A2/E2 per user 2026-11-16: no partial-charge anchor to the released backbone)
     "A0": dict(path="A", train_backbone="none", pretrained=True),
     "A1": dict(path="A", train_backbone="last", pretrained=True),
-    "A2": dict(path="A", train_backbone="all", pretrained=True, backbone_lr_scale=0.1, charge_anchor=100.0),
+    "A2": dict(path="A", train_backbone="all", pretrained=True, backbone_lr_scale=0.1, charge_anchor=0.0),
     "B1": dict(path="B", train_backbone="last", pretrained=True),
     "C1": dict(path="C", train_backbone="all", pretrained=False),
     "E0": dict(path="E", train_backbone="none", pretrained=True),
     "E1": dict(path="E", train_backbone="last", pretrained=True),
-    "E2": dict(path="E", train_backbone="all", pretrained=True, backbone_lr_scale=0.1, charge_anchor=100.0),
+    "E2": dict(path="E", train_backbone="all", pretrained=True, backbone_lr_scale=0.1, charge_anchor=0.0),
     "E3": dict(path="E", train_backbone="all", pretrained=False),
 }
 
