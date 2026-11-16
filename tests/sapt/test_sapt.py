@@ -96,3 +96,34 @@ def test_pairs_cover_exactly_the_cross_monomer_atoms():
     ab = (b["node_sign"] > 0)
     assert ab.sum() == 14 and (b["node_sign"] < 0).sum() == 14
     np.testing.assert_array_equal(b["atomic_numbers"][b["mon_node"][ab]], b["atomic_numbers"][ab])
+
+
+class _IonPair:
+    """Na+ ... Na+ at 6.67 A: two edgeless monomers, as in train row 871710."""
+
+    def dimer(self, d):
+        return (np.array([11, 11]), np.array([[0, 0, 0], [6.673, 0, 0.]]),
+                np.array((1, 1)), np.array((1, 1)), np.zeros(4))
+
+
+@pytest.mark.parametrize("path", ["A", "E"])
+def test_collapsed_ion_width_keeps_gradients_finite(path):
+    """A Na+ width driven to ~1e-26 A must not turn sqrt(s_i^2 + s_j^2) into sqrt(0).
+
+    A0 learned s(Na+) = 4e-21 A; its square underflows in float32, the pair width
+    became exactly 0 and the backward pass produced 0 * inf = NaN on every leaf.
+    """
+    m, p = _model(path, _Store(), perturb=False)
+    p = jax.tree_util.tree_map(lambda v: v, p)
+    tab = p["params"]["sigma_elem"]["table"]
+    p["params"]["sigma_elem"]["table"] = tab.at[11].set(-60.0)
+    b = jax.tree_util.tree_map(jnp.asarray, make_batch(_IonPair(), [0], three_pass=THREE_PASS[path]))
+
+    def loss(q):
+        return jnp.sum(m.apply(q, b)[0] ** 2)
+
+    val, g = jax.value_and_grad(loss)(p)
+    assert np.isfinite(float(val))
+    bad = [jax.tree_util.keystr(k) for k, v in jax.tree_util.tree_leaves_with_path(g)
+           if not np.all(np.isfinite(np.asarray(v)))]
+    assert bad == []

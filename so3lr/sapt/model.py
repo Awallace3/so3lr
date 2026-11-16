@@ -63,6 +63,21 @@ def _isp(y):
     return float(np.log(np.expm1(y)))
 
 
+SIGMA_FLOOR = 1.0e-3   # A; keeps the pair width off sqrt(0) when both s_i underflow
+
+
+def _pair_width(s, i, j):
+    """sigma_ij = sqrt(s_i^2 + s_j^2 + floor^2).
+
+    A learned width can saturate (A0 drove s(Na+) to 4e-21 A); its square underflows
+    in float32, and for an ion-ion pair sqrt(0) has an infinite derivative, so the
+    backward pass gave 0 * inf = NaN on every parameter. The floor changes sigma by
+    < 1e-5 relative for any width above 0.1 A and makes erf(r / sigma) a point charge
+    for r > 0.01 A, which is what a collapsed width already meant.
+    """
+    return jnp.sqrt(s[i] ** 2 + s[j] ** 2 + SIGMA_FLOOR ** 2)
+
+
 def _erf_coulomb(qq, r, sigma):
     return KE_KCAL * qq * jax.scipy.special.erf(r / sigma) / r
 
@@ -199,14 +214,14 @@ class SAPTModel(nn.Module):
 
         s = nn.softplus(ElementTable((_isp(self.sigma_init),), name="sigma_elem")(z)[:, 0]
                         + MLP(self.readout_widths, 1, name="sigma_mlp")(x_m)[:, 0])
-        sig_p = jnp.sqrt(s[pi] ** 2 + s[pj] ** 2)
+        sig_p = _pair_width(s, pi, pj)
         elst = pair_sum(_erf_coulomb(q_m[pi] * q_m[pj], rp, sig_p))
 
         # induction: charge relaxation over every pair of the AB graph
         li, lj, lab = batch["idx_i_lr"], batch["idx_j_lr"], batch["lr_on_ab"]
         shift = jnp.array([10.0, 0.0, 0.0], R.dtype)
         rl = jnp.linalg.norm(R[lj] - R[li] + (1.0 - lab)[:, None] * shift, axis=-1)
-        sig_l = jnp.sqrt(s[li] ** 2 + s[lj] ** 2)
+        sig_l = _pair_width(s, li, lj)
         dqq = q[li] * q[lj] - q_m[li] * q_m[lj]
         e_ind = 0.5 * lab * _erf_coulomb(dqq, rl, sig_l)
         ind = segment_sum(e_ind, batch["node_dimer"][li], nseg)[:num_dimers]
@@ -262,7 +277,7 @@ class SAPTModel(nn.Module):
 
         s = nn.softplus(ElementTable((_isp(self.sigma_init),), name="sigma_elem")(z)[:, 0]
                         + MLP(self.readout_widths, 1, name="sigma_mlp")(x)[:, 0])
-        sig_p = jnp.sqrt(s[pi] ** 2 + s[pj] ** 2)
+        sig_p = _pair_width(s, pi, pj)
         u_ei = MLP(self.pair_widths, 1, name="eli_pair")(h)[:, 0]
         eli = pair_sum(_erf_coulomb(q[pi] * q[pj], rp, sig_p) + fcut * u_ei)
 
